@@ -1,0 +1,4 @@
+# binaire compilé
+claude-usage-widget
+*.o
+.DS_Store
