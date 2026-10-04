@@ -6,6 +6,10 @@ struct Metric {
     var pct: Double
     var resetsAt: Date?
     var label: String
+    var window: TimeInterval     // durée de la fenêtre de quota, pour calculer le rythme
+
+    static let sessionWindow: TimeInterval = 5 * 3600
+    static let weekWindow: TimeInterval = 7 * 86400
 }
 
 struct Usage {
@@ -140,15 +144,15 @@ final class UsageFetcher {
                 let reset = parseDate(l["resets_at"] as? String)
                 switch kind {
                 case "session":
-                    u.session = Metric(pct: pct, resetsAt: reset, label: "Session")
+                    u.session = Metric(pct: pct, resetsAt: reset, label: "Session", window: Metric.sessionWindow)
                 case "weekly_all":
-                    u.weekly = Metric(pct: pct, resetsAt: reset, label: "Semaine")
+                    u.weekly = Metric(pct: pct, resetsAt: reset, label: "Semaine", window: Metric.weekWindow)
                 case "weekly_scoped":
                     var name = "Modèle"
                     if let scope = l["scope"] as? [String: Any],
                        let m = scope["model"] as? [String: Any],
                        let dn = m["display_name"] as? String { name = dn }
-                    let cand = Metric(pct: pct, resetsAt: reset, label: name)
+                    let cand = Metric(pct: pct, resetsAt: reset, label: name, window: Metric.weekWindow)
                     if u.scoped == nil || pct > u.scoped!.pct { u.scoped = cand }
                 default: break
                 }
@@ -156,13 +160,13 @@ final class UsageFetcher {
         }
 
         // Repli sur l'ancienne forme.
-        func legacy(_ key: String, _ label: String) -> Metric? {
+        func legacy(_ key: String, _ label: String, _ window: TimeInterval) -> Metric? {
             guard let d = json[key] as? [String: Any],
                   let util = (d["utilization"] as? NSNumber)?.doubleValue else { return nil }
-            return Metric(pct: util, resetsAt: parseDate(d["resets_at"] as? String), label: label)
+            return Metric(pct: util, resetsAt: parseDate(d["resets_at"] as? String), label: label, window: window)
         }
-        if u.session == nil { u.session = legacy("five_hour", "Session") }
-        if u.weekly == nil { u.weekly = legacy("seven_day", "Semaine") }
+        if u.session == nil { u.session = legacy("five_hour", "Session", Metric.sessionWindow) }
+        if u.weekly == nil { u.weekly = legacy("seven_day", "Semaine", Metric.weekWindow) }
 
         return u
     }
@@ -171,19 +175,23 @@ final class UsageFetcher {
 // ─────────────────────────────── Rendu ───────────────────────────────
 
 enum Palette {
-    static let bg      = NSColor(srgbRed: 0.086, green: 0.086, blue: 0.098, alpha: 0.94)
-    static let stroke  = NSColor(white: 1.0, alpha: 0.14)
+    static let bg      = NSColor(srgbRed: 0.094, green: 0.094, blue: 0.106, alpha: 0.94)
+    static let bgCrit  = NSColor(srgbRed: 0.157, green: 0.078, blue: 0.078, alpha: 0.94)
+    static let stroke  = NSColor(white: 1.0, alpha: 0.12)
     static let track   = NSColor(white: 1.0, alpha: 0.13)
+    static let rule    = NSColor(white: 1.0, alpha: 0.08)
     static let text    = NSColor(white: 0.96, alpha: 1.0)
-    static let dim     = NSColor(white: 1.0, alpha: 0.46)
-    static let faint   = NSColor(white: 1.0, alpha: 0.30)
+    static let soft    = NSColor(white: 0.84, alpha: 1.0)
+    static let dim     = NSColor(white: 1.0, alpha: 0.62)
+    static let faint   = NSColor(white: 1.0, alpha: 0.50)
+    static let muted   = NSColor(white: 0.45, alpha: 1.0)
     static let ok      = NSColor(srgbRed: 0.42, green: 0.82, blue: 0.55, alpha: 1)
     static let warn    = NSColor(srgbRed: 0.97, green: 0.70, blue: 0.31, alpha: 1)
     static let crit    = NSColor(srgbRed: 0.94, green: 0.38, blue: 0.35, alpha: 1)
 
     static func level(_ pct: Double) -> NSColor {
-        if pct >= 85 { return crit }
-        if pct >= 60 { return warn }
+        if pct >= 90 { return crit }
+        if pct >= 70 { return warn }
         return ok
     }
 }
@@ -199,6 +207,29 @@ func humanCountdown(_ date: Date?) -> String {
     return "\(s) s"
 }
 
+func resetPhrase(_ date: Date?) -> String? {
+    guard date != nil else { return nil }
+    let c = humanCountdown(date)
+    return c == "maintenant" ? "reset imminent" : "reset dans \(c)"
+}
+
+func agePhrase(_ date: Date?) -> String {
+    guard let date = date else { return "Pas encore actualisé" }
+    let s = Int(-date.timeIntervalSinceNow)
+    if s < 60 { return "Actualisé à l'instant" }
+    if s < 3600 { return "Actualisé il y a \(s / 60) min" }
+    return "Actualisé il y a \(s / 3600) h"
+}
+
+/// Où la jauge « devrait » être si la consommation était parfaitement régulière
+/// jusqu'au reset : la part de la fenêtre déjà écoulée, en %.
+func expectedPct(_ m: Metric) -> Double? {
+    guard let r = m.resetsAt else { return nil }
+    let left = r.timeIntervalSinceNow
+    guard left > 0, left <= m.window else { return nil }
+    return (1 - left / m.window) * 100
+}
+
 extension Int {
     var formattedTwo: String { self < 10 ? "0\(self)" : "\(self)" }
 }
@@ -209,163 +240,274 @@ final class WidgetView: NSView {
     var plan: String?
     var offline = false      // aucune donnée fraîche affichable
     var limited = false      // la cause est un HTTP 429, pas une panne réseau
-    var collapsed = false
+    var lastUpdate: Date?
+    var expanded = false     // taille visée : panneau déplié (survol ou épinglé)
+    var pinned = false
 
-    static let expandedWidth: CGFloat = 244
-    static let bubbleSize: CGFloat = 52
+    static let bubbleSize: CGFloat = 56
+    static let expandedWidth: CGFloat = 296
+    private static let pad: CGFloat = 16
+    private static let headerH: CGFloat = 56
+    private static let rowH: CGFloat = 62
+    private static let badgeCenter = NSPoint(x: 46, y: 10)
 
-    // Hauteur nécessaire selon le nombre de lignes affichées.
+    // Coordonnées depuis le haut : la pastille reste ancrée en haut à gauche
+    // pendant que le panneau se déplie vers le bas.
+    override var isFlipped: Bool { true }
+
+    private var rows: [Metric] {
+        [usage?.session, usage?.weekly, usage?.scoped].compactMap { $0 }
+    }
+
+    /// Hauteur du panneau déplié selon le nombre de lignes affichées.
     func expandedHeight() -> CGFloat {
-        var rows = 0
-        if usage?.session != nil { rows += 1 }
-        if usage?.weekly != nil { rows += 1 }
-        if usage?.scoped != nil { rows += 1 }
-        if rows == 0 { rows = 1 }
-        return 14 + 15 + CGFloat(rows) * 33 + 4
+        let body = rows.isEmpty ? 40 : CGFloat(rows.count) * Self.rowH
+        return Self.headerH + 14 + body + 14 + 14
+    }
+
+    /// Chiffre de la pastille : la session, à défaut la semaine.
+    private var headline: Double? { usage?.session?.pct ?? usage?.weekly?.pct }
+    private var critical: Bool { !offline && (headline ?? 0) >= 90 }
+
+    /// 0 = pastille, 1 = panneau complet. Suit la taille réelle de la fenêtre,
+    /// si bien que le contenu se dévoile au fil de l'animation.
+    private var progress: CGFloat {
+        let p = (bounds.width - Self.bubbleSize) / (Self.expandedWidth - Self.bubbleSize)
+        return max(0, min(1, p))
     }
 
     // MARK: dessin
 
     override func draw(_ dirtyRect: NSRect) {
-        let radius: CGFloat = collapsed ? bounds.width / 2 : 14
+        let t = progress
+        let radius = min(min(bounds.width, bounds.height) / 2, 28 - 10 * t)
         let card = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5),
                                 xRadius: radius, yRadius: radius)
-        Palette.bg.setFill()
+        (critical ? Palette.bgCrit : Palette.bg).setFill()
         card.fill()
-        Palette.stroke.setStroke()
+        (critical ? Palette.crit.withAlphaComponent(0.6) : Palette.stroke).setStroke()
         card.lineWidth = 1
         card.stroke()
 
-        collapsed ? drawBubble() : drawPanel()
+        drawPastille()
+
+        guard t > 0.01, let ctx = NSGraphicsContext.current else { return }
+        ctx.saveGraphicsState()
+        card.addClip()
+        ctx.cgContext.setAlpha(t * t)
+        drawHeader()
+        drawBody()
+        ctx.restoreGraphicsState()
     }
 
-    private func drawBubble() {
-        let c = NSPoint(x: bounds.midX, y: bounds.midY)
-        let s = usage?.session?.pct ?? 0
-        let w = usage?.weekly?.pct ?? 0
+    private func drawPastille() {
+        let c = NSPoint(x: 28, y: 28)
 
-        if offline {
-            drawString("—", font: .systemFont(ofSize: 15, weight: .semibold),
-                       color: Palette.faint, centeredIn: bounds, dy: 0)
+        if offline && !limited {
+            let ring = NSBezierPath()
+            ring.appendArc(withCenter: c, radius: 20, startAngle: 0, endAngle: 360)
+            ring.lineWidth = 4
+            ring.setLineDash([3, 4], count: 2, phase: 0)
+            NSColor(white: 1, alpha: 0.22).setStroke()
+            ring.stroke()
+            drawCentered("—", .systemFont(ofSize: 15, weight: .bold), Palette.faint, at: c)
+            drawBadge(Palette.crit, radius: 6)
             return
         }
 
-        drawRing(center: c, radius: 20, width: 3.5, pct: s, color: Palette.level(s))
-        drawRing(center: c, radius: 14.5, width: 2.5, pct: w, color: Palette.level(w).withAlphaComponent(0.55))
+        guard let pct = headline else {
+            drawRing(center: c, pct: 25, color: Palette.dim)
+            drawCentered("…", .systemFont(ofSize: 14, weight: .bold), Palette.dim, at: c)
+            return
+        }
 
-        drawString("\(Int(s.rounded()))",
-                   font: .monospacedDigitSystemFont(ofSize: 14, weight: .semibold),
-                   color: Palette.text, centeredIn: bounds, dy: 0)
+        // Bridé : on garde la dernière valeur connue, mais grisée.
+        let color = limited ? Palette.muted : Palette.level(pct)
+        drawRing(center: c, pct: pct, color: color)
+        drawCentered("\(Int(pct.rounded()))",
+                     .monospacedDigitSystemFont(ofSize: 14, weight: .bold),
+                     limited ? Palette.dim : (pct >= 70 ? color : Palette.text), at: c)
+        if limited { drawClockBadge() }
     }
 
-    private func drawRing(center: NSPoint, radius: CGFloat, width: CGFloat, pct: Double, color: NSColor) {
+    private func drawRing(center c: NSPoint, pct: Double, color: NSColor) {
         let track = NSBezierPath()
-        track.appendArc(withCenter: center, radius: radius, startAngle: 0, endAngle: 360)
-        track.lineWidth = width
+        track.appendArc(withCenter: c, radius: 20, startAngle: 0, endAngle: 360)
+        track.lineWidth = 4
         Palette.track.setStroke()
         track.stroke()
 
         let v = max(0, min(100, pct))
         guard v > 0 else { return }
+        // Vue retournée : angles croissants = sens horaire à l'écran, -90° = midi.
         let arc = NSBezierPath()
-        arc.appendArc(withCenter: center, radius: radius,
-                      startAngle: 90, endAngle: 90 - 360 * CGFloat(v / 100), clockwise: true)
-        arc.lineWidth = width
-        arc.lineCapStyle = .round
+        arc.appendArc(withCenter: c, radius: 20,
+                      startAngle: -90, endAngle: -90 + 360 * CGFloat(v / 100), clockwise: false)
+        arc.lineWidth = 4
         color.setStroke()
         arc.stroke()
     }
 
-    private func drawPanel() {
-        let pad: CGFloat = 14
-        var y = bounds.height - 14
-
-        // En-tête
-        let title = NSAttributedString(string: "CLAUDE", attributes: [
-            .font: NSFont.systemFont(ofSize: 9, weight: .bold),
-            .foregroundColor: Palette.dim,
-            .kern: 1.4
-        ])
-        title.draw(at: NSPoint(x: pad, y: y - 10))
-
-        let right = limited ? "bridé" : (offline ? "hors ligne" : (plan ?? "usage"))
-        let rightAttr = NSAttributedString(string: right, attributes: [
-            .font: NSFont.systemFont(ofSize: 9, weight: .medium),
-            .foregroundColor: limited ? Palette.warn : (offline ? Palette.crit : Palette.faint)
-        ])
-        rightAttr.draw(at: NSPoint(x: bounds.width - pad - rightAttr.size().width, y: y - 10))
-
-        y -= 15
-
-        var rows: [Metric] = []
-        if let m = usage?.session { rows.append(m) }
-        if let m = usage?.weekly { rows.append(m) }
-        if let m = usage?.scoped { rows.append(m) }
-
-        if rows.isEmpty {
-            let vide = limited ? "Quota d'API bridé" : (offline ? "Pas de données" : "Chargement…")
-            drawString(vide,
-                       font: .systemFont(ofSize: 11, weight: .regular),
-                       color: Palette.dim,
-                       centeredIn: NSRect(x: 0, y: 0, width: bounds.width, height: y), dy: 0)
-            return
-        }
-
-        for m in rows {
-            drawRow(m, top: y, pad: pad)
-            y -= 33
-        }
+    private func drawBadge(_ color: NSColor, radius r: CGFloat) {
+        let c = Self.badgeCenter
+        let dot = NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2))
+        color.setFill()
+        dot.fill()
+        dot.lineWidth = 2
+        Palette.bg.withAlphaComponent(1).setStroke()
+        dot.stroke()
     }
 
-    private func drawRow(_ m: Metric, top: CGFloat, pad: CGFloat) {
-        let w = bounds.width - pad * 2
-        let color = Palette.level(m.pct)
+    private func drawClockBadge() {
+        drawBadge(Palette.warn, radius: 8)
+        let c = Self.badgeCenter
+        let face = NSBezierPath(ovalIn: NSRect(x: c.x - 4, y: c.y - 4, width: 8, height: 8))
+        face.lineWidth = 1.3
+        let hands = NSBezierPath()
+        hands.move(to: NSPoint(x: c.x, y: c.y - 2.5))
+        hands.line(to: c)
+        hands.line(to: NSPoint(x: c.x + 2, y: c.y + 1))
+        hands.lineWidth = 1.3
+        hands.lineCapStyle = .round
+        hands.lineJoinStyle = .round
+        Palette.bg.withAlphaComponent(1).setStroke()
+        face.stroke()
+        hands.stroke()
+    }
+
+    private func headerLine() -> (String, NSColor) {
+        if limited { return ("Bridé — nouvel essai plus tard", Palette.warn) }
+        if offline { return ("Hors ligne", Palette.crit) }
+        if let s = usage?.session {
+            return (["Session", resetPhrase(s.resetsAt)].compactMap { $0 }.joined(separator: " · "), Palette.soft)
+        }
+        return ("Chargement…", Palette.dim)
+    }
+
+    private func drawHeader() {
+        let x: CGFloat = 62
+        let title = "CLAUDE" + (plan.map { " · " + $0.uppercased() } ?? "")
+        drawText(title, .systemFont(ofSize: 10, weight: .bold), Palette.dim, at: NSPoint(x: x, y: 11), kern: 1.2)
+        let (line, color) = headerLine()
+        drawText(line, .systemFont(ofSize: 12, weight: .regular), color, at: NSPoint(x: x, y: 27))
+    }
+
+    private func drawBody() {
+        let pad = Self.pad, right = Self.expandedWidth - pad
+        Palette.rule.setFill()
+        NSBezierPath(rect: NSRect(x: pad, y: Self.headerH, width: right - pad, height: 1)).fill()
+
+        var y = Self.headerH + 14
+        if rows.isEmpty {
+            let msg = limited ? "Quota d'API bridé" : (offline ? "Pas de données" : "Chargement…")
+            drawCentered(msg, .systemFont(ofSize: 12, weight: .regular), Palette.dim,
+                         at: NSPoint(x: Self.expandedWidth / 2, y: y + 20))
+            y += 40
+        } else {
+            for m in rows {
+                drawRow(m, top: y)
+                y += Self.rowH
+            }
+        }
+
+        // Pied : fraîcheur des données.
+        (limited ? Palette.warn : (offline ? Palette.crit : Palette.ok)).setFill()
+        NSBezierPath(ovalIn: NSRect(x: pad, y: y + 4, width: 6, height: 6)).fill()
+        let small = NSFont.systemFont(ofSize: 11, weight: .regular)
+        drawText(agePhrase(lastUpdate), small, Palette.faint, at: NSPoint(x: pad + 12, y: y))
+        drawTextRight(pinned ? "épinglé" : "clic droit : menu", small, Palette.faint, rightX: right, y: y)
+    }
+
+    private func drawRow(_ m: Metric, top y: CGFloat) {
+        let pad = Self.pad, right = Self.expandedWidth - pad, w = right - pad
+        let color = limited ? Palette.muted : Palette.level(m.pct)
 
         // Ligne de texte
-        let label = NSAttributedString(string: m.label, attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .medium),
-            .foregroundColor: Palette.text
-        ])
-        label.draw(at: NSPoint(x: pad, y: top - 13))
+        let label = drawText(m.label, .systemFont(ofSize: 13, weight: .semibold), Palette.text,
+                             at: NSPoint(x: pad, y: y))
+        if let r = resetPhrase(m.resetsAt) {
+            drawText(r, .monospacedDigitSystemFont(ofSize: 11, weight: .regular), Palette.dim,
+                     at: NSPoint(x: pad + label.width + 8, y: y + 2))
+        }
+        drawTextRight("\(Int(m.pct.rounded())) %", .monospacedDigitSystemFont(ofSize: 13, weight: .semibold),
+                      m.pct >= 70 && !limited ? color : Palette.text, rightX: right, y: y)
 
-        let reset = NSAttributedString(string: humanCountdown(m.resetsAt), attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 9.5, weight: .regular),
-            .foregroundColor: Palette.faint
-        ])
-        reset.draw(at: NSPoint(x: pad + label.size().width + 7, y: top - 12.5))
-
-        let pct = NSAttributedString(string: "\(Int(m.pct.rounded())) %", attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 11.5, weight: .semibold),
-            .foregroundColor: color
-        ])
-        pct.draw(at: NSPoint(x: bounds.width - pad - pct.size().width, y: top - 13.5))
-
-        // Barre
-        let barY = top - 22
-        let barH: CGFloat = 4.5
-        let track = NSBezierPath(roundedRect: NSRect(x: pad, y: barY, width: w, height: barH),
-                                 xRadius: barH / 2, yRadius: barH / 2)
+        // Barre, et le trait blanc du rythme régulier
+        let barY = y + 22, barH: CGFloat = 6
         Palette.track.setFill()
-        track.fill()
-
+        NSBezierPath(roundedRect: NSRect(x: pad, y: barY, width: w, height: barH), xRadius: 3, yRadius: 3).fill()
         let v = CGFloat(max(0, min(100, m.pct)) / 100)
         if v > 0 {
-            let fw = max(barH, w * v)
-            let fill = NSBezierPath(roundedRect: NSRect(x: pad, y: barY, width: fw, height: barH),
-                                    xRadius: barH / 2, yRadius: barH / 2)
             color.setFill()
-            fill.fill()
+            NSBezierPath(roundedRect: NSRect(x: pad, y: barY, width: max(barH, w * v), height: barH),
+                         xRadius: 3, yRadius: 3).fill()
+        }
+        let expected = expectedPct(m)
+        if let e = expected {
+            Palette.text.setFill()
+            let tx = pad + w * CGFloat(e / 100) - 1
+            NSBezierPath(roundedRect: NSRect(x: tx, y: barY - 3, width: 2, height: barH + 6),
+                         xRadius: 1, yRadius: 1).fill()
+        }
+
+        // Verdict : marge ou avance sur le rythme
+        var verdict: (String, NSColor)?
+        if m.pct >= 90 {
+            verdict = ("Presque à sec — pause café ?", Palette.crit)
+        } else if let e = expected {
+            let d = Int((e - m.pct).rounded())
+            if abs(d) <= 2 { verdict = ("Pile dans le rythme", Palette.ok) }
+            else if d > 0 { verdict = ("\(d) pts de marge sur le rythme", Palette.ok) }
+            else { verdict = ("\(-d) pts d'avance — lève le pied", Palette.warn) }
+        }
+        if let v = verdict {
+            drawText(v.0, .systemFont(ofSize: 11, weight: .regular), limited ? Palette.dim : v.1,
+                     at: NSPoint(x: pad, y: y + 34))
         }
     }
 
-    private func drawString(_ s: String, font: NSFont, color: NSColor, centeredIn rect: NSRect, dy: CGFloat) {
+    @discardableResult
+    private func drawText(_ s: String, _ font: NSFont, _ color: NSColor, at p: NSPoint, kern: CGFloat = 0) -> NSSize {
+        var attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        if kern != 0 { attrs[.kern] = kern }
+        let a = NSAttributedString(string: s, attributes: attrs)
+        a.draw(at: p)
+        return a.size()
+    }
+
+    private func drawTextRight(_ s: String, _ font: NSFont, _ color: NSColor, rightX: CGFloat, y: CGFloat) {
+        let a = NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color])
+        a.draw(at: NSPoint(x: rightX - a.size().width, y: y))
+    }
+
+    private func drawCentered(_ s: String, _ font: NSFont, _ color: NSColor, at c: NSPoint) {
         let a = NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: color])
         let size = a.size()
-        a.draw(at: NSPoint(x: rect.midX - size.width / 2,
-                           y: rect.midY - size.height / 2 + dy))
+        a.draw(at: NSPoint(x: c.x - size.width / 2, y: c.y - size.height / 2))
     }
 
     // MARK: interactions
+
+    private var tracking: NSTrackingArea?
+    private var controller: AppDelegate? { NSApp.delegate as? AppDelegate }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let t = tracking { removeTrackingArea(t) }
+        let t = NSTrackingArea(rect: .zero,
+                               options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                               owner: self, userInfo: nil)
+        addTrackingArea(t)
+        tracking = t
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseEntered(with event: NSEvent) { controller?.hoverChanged() }
+
+    override func mouseExited(with event: NSEvent) {
+        if dragOrigin == nil { controller?.hoverChanged() }
+    }
 
     private var dragOrigin: NSPoint?
     private var windowOrigin: NSPoint?
@@ -388,16 +530,17 @@ final class WidgetView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         if didDrag {
-            (NSApp.delegate as? AppDelegate)?.savePosition()
+            controller?.savePosition()
+            controller?.hoverChanged()
         } else {
-            (NSApp.delegate as? AppDelegate)?.toggleCollapsed()
+            controller?.togglePinned()
         }
         dragOrigin = nil
         windowOrigin = nil
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        (NSApp.delegate as? AppDelegate)?.showMenu(event: event, in: self)
+        controller?.showMenu(event: event, in: self)
     }
 }
 
@@ -433,7 +576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.createDirectory(at: supportDir, withIntermediateDirectories: true)
         guard acquireSingleInstanceLock() else { NSApp.terminate(nil); return }
 
-        view = WidgetView(frame: NSRect(x: 0, y: 0, width: WidgetView.expandedWidth, height: 120))
+        view = WidgetView(frame: NSRect(x: 0, y: 0, width: WidgetView.bubbleSize, height: WidgetView.bubbleSize))
 
         panel = WidgetPanel(contentRect: view.frame,
                             styleMask: [.borderless, .nonactivatingPanel],
@@ -505,6 +648,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             switch result {
             case .ok(let usage):
                 self.view.usage = usage
+                self.view.lastUpdate = Date()
                 self.view.offline = false
                 self.view.limited = false
                 if self.backoffStep > 0 { journal("usage: rétabli, backoff levé") }
@@ -534,28 +678,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var savedTopRight: NSPoint?
 
-    func toggleCollapsed() {
-        view.collapsed.toggle()
-        applyGeometry(animated: true)
+    // MARK: survol
+
+    private var pinned = false       // clic : le panneau reste déplié sans survol
+    private var hovering = false
+    private var hoverTimer: Timer?
+
+    private var isMouseInside: Bool { NSMouseInRect(NSEvent.mouseLocation, panel.frame, false) }
+
+    /// Appelé à chaque entrée/sortie de la souris. On relit la position réelle du
+    /// curseur après un court délai : un passage éclair ne déplie rien, et un
+    /// aller-retour rapide ne fait pas clignoter le panneau.
+    func hoverChanged() {
+        hoverTimer?.invalidate()
+        let inside = isMouseInside
+        guard inside != hovering else { return }
+        hoverTimer = Timer.scheduledTimer(withTimeInterval: inside ? 0.12 : 0.35, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            let now = self.isMouseInside
+            guard now != self.hovering else { return }
+            self.hovering = now
+            self.updateExpanded()
+        }
+    }
+
+    func togglePinned() {
+        pinned.toggle()
+        updateExpanded()
         savePosition()
     }
 
+    private func updateExpanded() {
+        view.pinned = pinned
+        view.needsDisplay = true
+        let want = hovering || pinned
+        guard want != view.expanded else { return }
+        view.expanded = want
+        applyGeometry(animated: true)
+    }
+
     private func applyGeometry(animated: Bool) {
-        let size = view.collapsed
-            ? NSSize(width: WidgetView.bubbleSize, height: WidgetView.bubbleSize)
-            : NSSize(width: WidgetView.expandedWidth, height: view.expandedHeight())
+        let size = view.expanded
+            ? NSSize(width: WidgetView.expandedWidth, height: view.expandedHeight())
+            : NSSize(width: WidgetView.bubbleSize, height: WidgetView.bubbleSize)
 
         let anchor = savedTopRight ?? defaultTopRight()
         let frame = NSRect(x: anchor.x - size.width, y: anchor.y - size.height,
                            width: size.width, height: size.height)
         if animated {
-            NSAnimationContext.runAnimationGroup { ctx in
-                ctx.duration = 0.16
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.22
+                ctx.timingFunction = CAMediaTimingFunction(controlPoints: 0.2, 0.8, 0.2, 1)
                 panel.animator().setFrame(frame, display: true)
-            }
+            }, completionHandler: { [weak self] in
+                self?.panel.invalidateShadow()
+            })
         } else {
             panel.setFrame(frame, display: true)
+            panel.invalidateShadow()
         }
         view.needsDisplay = true
     }
@@ -571,7 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let dict: [String: Any] = [
             "x": savedTopRight!.x,
             "y": savedTopRight!.y,
-            "collapsed": view.collapsed
+            "pinned": pinned
         ]
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]) {
             try? data.write(to: configURL)
@@ -587,7 +767,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 savedTopRight = p
             }
         }
-        view.collapsed = (d["collapsed"] as? NSNumber)?.boolValue ?? false
+        pinned = (d["pinned"] as? NSNumber)?.boolValue ?? false
+        view.pinned = pinned
+        view.expanded = pinned
     }
 
     @objc func resetPosition() {
@@ -602,8 +784,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Rafraîchir", action: #selector(refreshFromMenu), keyEquivalent: "")
             .target = self
-        menu.addItem(withTitle: self.view.collapsed ? "Agrandir" : "Réduire en bulle",
-                     action: #selector(menuToggle), keyEquivalent: "").target = self
+        let pin = menu.addItem(withTitle: "Garder ouvert", action: #selector(menuTogglePin), keyEquivalent: "")
+        pin.target = self
+        pin.state = pinned ? .on : .off
         menu.addItem(withTitle: "Replacer en haut à droite", action: #selector(resetPosition), keyEquivalent: "")
             .target = self
         menu.addItem(.separator())
@@ -613,9 +796,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quitter", action: #selector(quit), keyEquivalent: "").target = self
         NSMenu.popUpContextMenu(menu, with: event, for: view)
+        // Le menu est modal : la souris a pu quitter le widget pendant qu'il était ouvert.
+        hoverChanged()
     }
 
-    @objc private func menuToggle() { toggleCollapsed() }
+    @objc private func menuTogglePin() { togglePinned() }
 
     @objc private func quit() { NSApp.terminate(nil) }
 

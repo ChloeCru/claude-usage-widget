@@ -4,8 +4,15 @@ Petit widget flottant pour macOS qui affiche la consommation réelle de ton
 forfait Claude Code : fenêtre de session, quota hebdomadaire, et quota par
 modèle. Swift/AppKit, un seul fichier, aucune dépendance.
 
-Un clic bascule entre le panneau détaillé et une bulle compacte. Clic droit
-pour le menu (rafraîchir, réduire, replacer, lancer au démarrage, quitter).
+Au repos, c'est une petite pastille ronde : l'anneau se remplit avec la
+session en cours (vert, orange dès 70 %, rouge dès 90 %). Passe la souris
+dessus et elle se déplie en panneau détaillé ; elle se replie quand la souris
+s'en va. Un clic l'épingle ouverte (re-clic pour libérer). Clic droit pour le
+menu (rafraîchir, garder ouvert, replacer, lancer au démarrage, quitter).
+
+Sur chaque barre, un trait blanc marque le **rythme régulier** : là où tu en
+serais si tu consommais ton quota à vitesse constante jusqu'au reset. Barre
+avant le trait = de la marge ; barre au-delà = tu vas trop vite.
 
 > **Non officiel.** Ce projet n'est ni affilié à Anthropic ni approuvé par
 > Anthropic. Il s'appuie sur `/api/oauth/usage`, un endpoint **non documenté**
